@@ -1,0 +1,13 @@
+# Local datasets and generated artifacts
+data/
+.venv/
+.env
+.idea/
+.codex/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+.DS_Store
+*.pyc
+*.log
+*.zip
