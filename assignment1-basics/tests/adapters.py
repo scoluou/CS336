@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import multiprocessing
 import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
@@ -8,6 +9,12 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+
+import regex as re
+from cs336_basics.pretokenization_example import find_chunk_boundaries
+from tests.conftest import vocab_size
+import multiprocessing as mp
+from collections import Counter
 
 
 def run_linear(
@@ -562,6 +569,31 @@ def get_tokenizer(
     raise NotImplementedError
 
 
+def get_chunk_raw_str(path, start, end) -> str:
+    with open(path, 'rb') as chunk_file:
+        chunk_file.seek(start)
+        return chunk_file.read(end - start).decode("utf-8", errors="ignore")
+
+
+def pre_tokenization(job: tuple[str, int, int, str]) -> dict[tuple[bytes, ...], int]:
+    path, start, end, sp_token = job
+    chunk_str = get_chunk_raw_str(path, start, end)
+
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    pattern = re.compile(PAT)
+
+    local_word_count: dict[tuple[bytes, ...], int] = {}
+
+    # Remove eof by split chunk into segments using split
+    for segment in chunk_str.split(sp_token):
+        for match in re.finditer(pattern, segment):
+            encoded_word = match.group().encode('utf8', errors='ignore')
+            encoded_tuple = tuple(bytes([b]) for b in encoded_word)
+            local_word_count[encoded_tuple] = local_word_count.get(encoded_tuple, 0) + 1
+
+    return local_word_count
+
+
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -589,4 +621,36 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+
+    ret_vocab = dict[int, bytes]
+    ret_merges = list[tuple[bytes, bytes]]
+
+    # Assume only eof as sp tokens
+    assert len(special_tokens) == 1
+    encoded_special_tokens_id = 256 + 1
+    assert vocab_size >= 256 + len(special_tokens)
+    bpe_merge_vocab_size = vocab_size - 256 - len(special_tokens)
+
+    num_chunks = 16
+    # Get chunk boundaries
+    with open (input_path, 'rb') as input_file:
+        encoded_special_tokens = [sp_token.encode('utf8', errors='ignore') for sp_token in special_tokens]
+        boundaries = find_chunk_boundaries(input_file, num_chunks, encoded_special_tokens[0])
+
+    # Parallel pre-tokenization
+    num_threads = 8
+    actual_chunks = len(boundaries) - 1
+    jobs = [
+        (input_path, start, end, special_tokens[0])
+        for start, end in zip(boundaries, boundaries[1:])
+    ]
+    global_word_count = Counter()
+    with mp.Pool(processes=min(num_threads, actual_chunks)) as pool:
+        for local_counts in pool.imap(pre_tokenization, jobs):
+            global_word_count.update(local_counts)
+
+    # BPE Merge with pair count caching
+
+
+    return ret_vocab, ret_merges
+
