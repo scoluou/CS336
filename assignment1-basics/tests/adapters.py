@@ -651,16 +651,23 @@ def run_train_bpe(
 
     # BPE merge with pair count caching
     merged_count = 0
-    # Stores affected tokens
-    merged_tokens_dict: dict[tuple[bytes, ...], int] = global_word_count.copy()
+    # Stores affected tokens(need to recalculate pair_count due to merge)
+    affected_tokens: set[tuple[bytes, ...]] = {tokens for tokens, count in global_word_count.items()}
+    # Cached pair count, update after merge
     pair_count: dict[tuple[bytes, bytes], int] = {}
+    # Stores pair to tokens map, used to update global word count after merge
     pair_to_tokens: dict[tuple[bytes, bytes], set[tuple[bytes, ...]]] = {}
+
     while merged_count < bpe_merge_vocab_size:
-        for tokens, count in merged_tokens_dict.items():
-            for i in range(len(tokens) - 1):
-                token_pair: tuple[bytes, bytes] = (tokens[i], tokens[i+1])
-                pair_count[token_pair] = pair_count.get(token_pair, 0) + count
-                pair_to_tokens.setdefault(token_pair, set()).add(tokens)
+        # Recalculate pair_count only for affected_tokens
+        for tokens in affected_tokens:
+            count = global_word_count[tokens]
+            for pair in zip(tokens, tokens[1:]):
+                pair_count[pair] = pair_count.get(pair, 0) + count
+                pair_to_tokens.setdefault(pair, set()).add(tokens)
+
+        # All affected tokens this round are processed, clear
+        affected_tokens.clear()
 
         # Get max pair
         max_pair = max(pair_count, key=lambda pair : (pair_count[pair], pair))
@@ -668,24 +675,21 @@ def run_train_bpe(
         ret_vocab[encoded_special_tokens_id + merged_count] = max_pair[0] + max_pair[1]
         ret_merges.append(max_pair)
 
-        # Recalculate global_word_count after merge
-        merged_tokens_dict.clear()
-
         for tokens in pair_to_tokens[max_pair].copy():
-            old_tokens = tokens
-            new_tokens = []
             count = global_word_count[tokens]
-
+            # Decrease pair count
+            for pair in zip(tokens, tokens[1:]):
+                pair_count[pair] -= count
             # Remove old tokens form global_word_count
-            global_word_count.pop(old_tokens)
-
+            global_word_count.pop(tokens)
             # Clear old pair to tokens
             for pair in set(zip(tokens, tokens[1:])):
                 pair_to_tokens[pair].discard(tokens)
                 if not pair_to_tokens[pair]:
                     del pair_to_tokens[pair]
 
-            # Get merged tokens
+            # Get merged new tokens
+            new_tokens = []
             i = 0
             while i < len(tokens):
                 if i + 1 < len(tokens) and (tokens[i], tokens[i+1]) == max_pair:
@@ -695,12 +699,13 @@ def run_train_bpe(
                     new_tokens.append(tokens[i])
                     i += 1
             new_tokens = tuple(new_tokens)
-            global_word_count[new_tokens] = count
 
-            merged_tokens_dict[new_tokens] = (
-                    merged_tokens_dict.get(new_tokens, 0) + count)
-            # Decrease pair count if is_merged
-            for i in range(len(tokens) - 1):
-                pair_count[tokens[i], tokens[i+1]] -= count
+            global_word_count[new_tokens] = global_word_count.get(new_tokens, 0) + count
+            affected_tokens.add(new_tokens)
+
+        # Clear pair with count == 0
+        # for pair, count in list(pair_count.items()):
+        #     if count == 0:
+        #         pair_count.pop(pair)
 
     return ret_vocab, ret_merges
