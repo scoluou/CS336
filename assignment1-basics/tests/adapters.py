@@ -621,15 +621,15 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-
-    ret_vocab = dict[int, bytes]
-    ret_merges = list[tuple[bytes, bytes]]
+    ret_vocab: dict[int, bytes] = {i : bytes([i]) for i in range(256)}
+    ret_merges: list[tuple[bytes, bytes]] = []
 
     # Assume only eof as sp tokens
     assert len(special_tokens) == 1
-    encoded_special_tokens_id = 256 + 1
+    encoded_special_tokens_id = 256
     assert vocab_size >= 256 + len(special_tokens)
     bpe_merge_vocab_size = vocab_size - 256 - len(special_tokens)
+    ret_vocab[encoded_special_tokens_id] = special_tokens[0].encode('utf-8', errors='ignore')
 
     num_chunks = 16
     # Get chunk boundaries
@@ -649,8 +649,47 @@ def run_train_bpe(
         for local_counts in pool.imap(pre_tokenization, jobs):
             global_word_count.update(local_counts)
 
-    # BPE Merge with pair count caching
+    # BPE merge with pair count caching
+    merged_count = 0
+    # Stores affected tokens
+    merged_tokens_set: set[tuple[bytes, ...]] = set()
+    pair_count: dict[tuple[bytes, bytes], int] = {}
+    while merged_count < bpe_merge_vocab_size:
+        for tokens, count in global_word_count.items():
+            if tokens in merged_tokens_set or merged_count == 0:
+                for i in range(len(tokens) - 1):
+                    token_pair: tuple[bytes, bytes] = (tokens[i], tokens[i+1])
+                    pair_count[token_pair] = pair_count.get(token_pair, 0) + count
+        # Get max pair
+        max_pair = max(pair_count, key=lambda pair : (pair_count[pair], pair))
+        merged_count += 1
+        ret_vocab[encoded_special_tokens_id + merged_count] = max_pair[0] + max_pair[1]
+        ret_merges.append(max_pair)
 
+        # Recalculate global_word_count after merge
+        word_count_after_merge = Counter()
+        merged_tokens_set.clear()
+        for tokens, count in global_word_count.items():
+            is_merged = False
+            merged_tokens = []
+            i = 0
+            while i < len(tokens):
+                if i + 1 < len(tokens) and (tokens[i], tokens[i+1]) == max_pair:
+                    merged_tokens.append((tokens[i] + tokens[i+1]))
+                    i += 2
+                    is_merged = True
+                else:
+                    merged_tokens.append(tokens[i])
+                    i += 1
+            word_count_after_merge[tuple(merged_tokens)] += count
+
+            if is_merged:
+                # Mark tokens
+                merged_tokens_set.add(tuple(merged_tokens))
+                # Decrease pair count if is_merged
+                for i in range(len(tokens) - 1):
+                    pair_count[tokens[i], tokens[i+1]] -= count
+
+        global_word_count = word_count_after_merge
 
     return ret_vocab, ret_merges
-
