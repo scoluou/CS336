@@ -563,11 +563,6 @@ class BPETokenizer:
                         vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], sp_tokens=None):
         self.vocab = vocab
         self.merges = merges
-        self.sp_tokens = sp_tokens
-
-        self.has_sp_tokens = sp_tokens is not None
-        self.encoded_sp_tokens = [sp_token.encode('utf-8') for sp_token in sp_tokens] if self.has_sp_tokens else None
-
         self.pattern = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
         self.bytes_to_id: dict[bytes, int] = {}
@@ -578,14 +573,30 @@ class BPETokenizer:
         for i in range(len(merges)):
             self.pari_to_create_index[merges[i]] = i
 
+        self.sp_tokens = sp_tokens
+        self.has_sp_tokens = sp_tokens is not None
+        if self.has_sp_tokens:
+            self.sp_token_id: dict[str, int] = {}
+            for sp_token in sp_tokens:
+                self.sp_token_id[sp_token] = self.bytes_to_id[sp_token.encode('utf-8')]
+
     def encode(self, text: str) -> list[int]:
         encoded_ids: list[int] = []
 
-        # TODO: Preprocess segments
+        if self.has_sp_tokens:
+            # Split text into segments
+            sorted_sp_tokens = sorted(self.sp_tokens, key=len, reverse=True)
+            pattern = "|".join(re.escape(sp_token) for sp_token in sorted_sp_tokens)
+            segments = re.split(f"({pattern})", text) if pattern else [text]
+        else:
+            segments = [text]
 
-        segments = text.split(self.sp_tokens[0]) if self.has_sp_tokens else [text]
-        for segment_index, segment in enumerate(segments):
-            print(segment)
+        for segment in segments:
+            # If segment is special token, append special token id and continue
+            if self.has_sp_tokens and segment in self.sp_tokens:
+                encoded_ids.append(self.sp_token_id[segment])
+                continue
+
             split_text = self.pattern.findall(segment)
 
             for word in split_text:
@@ -613,10 +624,6 @@ class BPETokenizer:
                     else:
                         break
                 encoded_ids.extend([self.bytes_to_id.get(token_bytes, 0) for token_bytes in pre_token])
-
-            # Append special token encoding
-            if self.has_sp_tokens and segment_index != len(segments) - 1:
-                encoded_ids.append(self.bytes_to_id.get(self.encoded_sp_tokens[0], 0))
 
         return encoded_ids
 
