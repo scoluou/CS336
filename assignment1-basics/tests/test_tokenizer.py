@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import resource
 import sys
 
 import psutil
@@ -19,6 +18,8 @@ MERGES_PATH = FIXTURES_PATH / "gpt2_merges.txt"
 def memory_limit(max_mem):
     def decorator(f):
         def wrapper(*args, **kwargs):
+            import resource
+
             process = psutil.Process(os.getpid())
             prev_limits = resource.getrlimit(resource.RLIMIT_AS)
             resource.setrlimit(resource.RLIMIT_AS, (process.memory_info().rss + max_mem, -1))
@@ -42,10 +43,10 @@ def get_tokenizer_from_vocab_merges_path(
     special_tokens: list[str] | None = None,
 ):
     gpt2_byte_decoder = {v: k for k, v in gpt2_bytes_to_unicode().items()}
-    with open(vocab_path) as vocab_f:
+    with open(vocab_path, encoding="utf-8") as vocab_f:
         gpt2_vocab = json.load(vocab_f)
     gpt2_bpe_merges = []
-    with open(merges_path) as f:
+    with open(merges_path, encoding="utf-8") as f:
         for line in f:
             cleaned_line = line.rstrip()
             if cleaned_line and len(cleaned_line.split(" ")) == 2:
@@ -413,11 +414,68 @@ def test_encode_iterable_tinystories_matches_tiktoken():
     assert reference_tokenizer.decode(reference_ids) == corpus_contents
 
 
+def _windows_memory_worker(case, sender):
+    from .windows_memory_limit import limit_additional_commit
+
+    try:
+        tokenizer = get_tokenizer_from_vocab_merges_path(VOCAB_PATH, MERGES_PATH)
+        with open(FIXTURES_PATH / "tinystories_sample_5M.txt", encoding="utf-8") as f:
+            if case == "iterable":
+                with limit_additional_commit(int(1e6)):
+                    count = sum(1 for _ in tokenizer.encode_iterable(f))
+                if count == 0:
+                    raise AssertionError("encode_iterable produced no tokens")
+            elif case == "encode":
+                contents = f.read()
+                with limit_additional_commit(int(1e6)):
+                    tokenizer.encode(contents)
+            else:
+                raise ValueError(f"unknown memory test: {case}")
+    except MemoryError:
+        outcome = ("memory_error", "1 MB process commit limit reached")
+    except BaseException as exc:
+        outcome = ("error", f"{type(exc).__name__}: {exc}"[:500])
+    else:
+        outcome = ("ok", "")
+    sender.send(outcome)
+    sender.close()
+
+
+def _run_windows_memory_case(case):
+    from multiprocessing import get_context
+
+    context = get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_windows_memory_worker, args=(case, sender))
+    try:
+        process.start()
+        sender.close()
+        process.join(timeout=120)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+            return "error", "memory test child timed out"
+        if not receiver.poll():
+            return "error", f"memory test child exited without a result (exit code {process.exitcode})"
+        return receiver.recv()
+    finally:
+        receiver.close()
+        sender.close()
+        if process.is_alive():
+            process.terminate()
+            process.join()
+
+
 @pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="rlimit support for non-linux systems is spotty.",
+    not (sys.platform.startswith("linux") or sys.platform == "win32"),
+    reason="memory limits are only tested on Linux and Windows.",
 )
 def test_encode_iterable_memory_usage():
+    if sys.platform == "win32":
+        status, detail = _run_windows_memory_case("iterable")
+        assert status == "ok", detail
+        return
+
     tokenizer = get_tokenizer_from_vocab_merges_path(
         vocab_path=VOCAB_PATH,
         merges_path=MERGES_PATH,
@@ -429,14 +487,24 @@ def test_encode_iterable_memory_usage():
 
 
 @pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="rlimit support for non-linux systems is spotty.",
+    not (sys.platform.startswith("linux") or sys.platform == "win32"),
+    reason="memory limits are only tested on Linux and Windows.",
 )
-@pytest.mark.xfail(reason="Tokenizer.encode is expected to take more memory than allotted (1MB).")
+@pytest.mark.xfail(
+    sys.platform.startswith("linux"),
+    reason="Tokenizer.encode is expected to take more memory than allotted (1MB).",
+)
 def test_encode_memory_usage():
     """
     We expect this test to fail, since Tokenizer.encode is not expected to be memory efficient.
     """
+    if sys.platform == "win32":
+        status, detail = _run_windows_memory_case("encode")
+        if status == "memory_error":
+            pytest.xfail(detail)
+        assert status == "ok", detail
+        pytest.fail("Tokenizer.encode unexpectedly stayed within the 1 MB process commit limit")
+
     tokenizer = get_tokenizer_from_vocab_merges_path(
         vocab_path=VOCAB_PATH,
         merges_path=MERGES_PATH,

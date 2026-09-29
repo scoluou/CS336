@@ -3,6 +3,7 @@ from __future__ import annotations
 import multiprocessing
 import os
 from collections.abc import Iterable
+from pkgutil import extend_path
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
@@ -10,6 +11,8 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
+import time
+import pickle
 import regex as re
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 from tests.conftest import vocab_size
@@ -546,11 +549,91 @@ def run_load_checkpoint(
     raise NotImplementedError
 
 
+class BPETokenizer:
+    def __init__(self, vocab, merges, sp_tokens=None):
+        super().__init__()
+        self.__init_internal(vocab, merges, sp_tokens)
+
+    def from_files(self, file_path, sp_tokens=None):
+        with open(file_path, 'rb') as f:
+            saved = pickle.load(f)
+            self.__init_internal(saved.vocab, saved.merges, sp_tokens)
+
+    def __init_internal(self,
+                        vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], sp_tokens=None):
+        self.vocab = vocab
+        self.merges = merges
+        self.sp_tokens = sp_tokens
+
+        self.has_sp_tokens = sp_tokens is not None
+        self.encoded_sp_tokens = [sp_token.encode('utf-8') for sp_token in sp_tokens] if self.has_sp_tokens else None
+
+        self.pattern = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+
+        self.bytes_to_id: dict[bytes, int] = {}
+        for token_id, token_bytes in self.vocab.items():
+            self.bytes_to_id[token_bytes] = token_id
+
+        self.pari_to_create_index: dict[tuple[bytes, bytes], int]= {}
+        for i in range(len(merges)):
+            self.pari_to_create_index[merges[i]] = i
+
+    def encode(self, text: str) -> list[int]:
+        encoded_ids: list[int] = []
+
+        # TODO: Preprocess segments
+
+        segments = text.split(self.sp_tokens[0]) if self.has_sp_tokens else [text]
+        for segment_index, segment in enumerate(segments):
+            print(segment)
+            split_text = self.pattern.findall(segment)
+
+            for word in split_text:
+                pre_token: tuple[bytes, ...] = tuple(bytes([token]) for token in word.encode('utf-8', errors='replace'))
+                merged_token: list[bytes] = []
+                while True:
+                    # Find candidate merge pairs with highest priority
+                    merge_index = -1
+                    current_merge_priority = 2**31 - 1
+                    for i in range(len(pre_token) - 1):
+                        merge_priority = self.pari_to_create_index.get((pre_token[i], pre_token[i + 1]), -1)
+                        if merge_priority != -1 and merge_priority < current_merge_priority:
+                            merge_index = i
+                            current_merge_priority = merge_priority
+
+                    # Merge with highest priority
+                    if merge_index >= 0:
+                        merged_token.extend(pre_token[:merge_index])
+                        merged_token.append(pre_token[merge_index] + pre_token[merge_index + 1])
+                        merged_token.extend(pre_token[merge_index+2:])
+
+                        # print(f'{pre_token} -> {merged_token}')
+                        pre_token = tuple(merged_token)
+                        merged_token.clear()
+                    else:
+                        break
+                encoded_ids.extend([self.bytes_to_id.get(token_bytes, 0) for token_bytes in pre_token])
+
+            # Append special token encoding
+            if self.has_sp_tokens and segment_index != len(segments) - 1:
+                encoded_ids.append(self.bytes_to_id.get(self.encoded_sp_tokens[0], 0))
+
+        return encoded_ids
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterable[int]:
+        pass
+
+    def decode(self, ids: list[int]) -> str:
+        # Convert to a full bytes and decode once rather than decode each byte
+        decoded_bytes = [self.vocab[id] for id in ids]
+        return b''.join(decoded_bytes).decode('utf-8', errors='replace')
+
+
 def get_tokenizer(
     vocab: dict[int, bytes],
     merges: list[tuple[bytes, bytes]],
     special_tokens: list[str] | None = None,
-) -> Any:
+) -> BPETokenizer:
     """Given a vocabulary, a list of merges, and a list of special tokens,
     return a BPE tokenizer that uses the provided vocab, merges, and special tokens.
 
@@ -566,7 +649,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return BPETokenizer(vocab, merges, special_tokens)
 
 
 def get_chunk_raw_str(path, start, end) -> str:
@@ -575,7 +658,7 @@ def get_chunk_raw_str(path, start, end) -> str:
         return chunk_file.read(end - start).decode("utf-8", errors="ignore")
 
 
-def pre_tokenization(job: tuple[str, int, int, str]) -> dict[tuple[bytes, ...], int]:
+def pre_tokenization(job: tuple[str | os.PathLike, int, int, str]) -> dict[tuple[bytes, ...], int]:
     path, start, end, sp_token = job
     chunk_str = get_chunk_raw_str(path, start, end)
 
@@ -631,23 +714,33 @@ def run_train_bpe(
     bpe_merge_vocab_size = vocab_size - 256 - len(special_tokens)
     ret_vocab[encoded_special_tokens_id] = special_tokens[0].encode('utf-8', errors='ignore')
 
-    num_chunks = 16
+    start_time = time.time()
+    num_chunks = 4
     # Get chunk boundaries
     with open (input_path, 'rb') as input_file:
         encoded_special_tokens = [sp_token.encode('utf8', errors='ignore') for sp_token in special_tokens]
         boundaries = find_chunk_boundaries(input_file, num_chunks, encoded_special_tokens[0])
+    end_time = time.time()
+    print(f'find chunk boundaries {end_time - start_time:.3f}s')
 
     # Parallel pre-tokenization
+    start_time = time.time()
     num_threads = 8
     actual_chunks = len(boundaries) - 1
     jobs = [
         (input_path, start, end, special_tokens[0])
         for start, end in zip(boundaries, boundaries[1:])
     ]
-    global_word_count = Counter()
-    with mp.Pool(processes=min(num_threads, actual_chunks)) as pool:
-        for local_counts in pool.imap(pre_tokenization, jobs):
-            global_word_count.update(local_counts)
+    if actual_chunks > 1:
+        global_word_count = Counter()
+        with mp.Pool(processes=min(num_threads, actual_chunks)) as pool:
+            for local_counts in pool.imap(pre_tokenization, jobs):
+                global_word_count.update(local_counts)
+    else:
+        global_word_count = pre_tokenization(jobs[0])
+
+    end_time = time.time()
+    print(f'pre tokenization {end_time - start_time:.3f}s')
 
     # BPE merge with pair count caching
     merged_count = 0
@@ -658,6 +751,7 @@ def run_train_bpe(
     # Stores pair to tokens map, used to update global word count after merge
     pair_to_tokens: dict[tuple[bytes, bytes], set[tuple[bytes, ...]]] = {}
 
+    start_time = time.time()
     while merged_count < bpe_merge_vocab_size:
         # Recalculate pair_count only for affected_tokens
         for tokens in affected_tokens:
@@ -670,11 +764,14 @@ def run_train_bpe(
         affected_tokens.clear()
 
         # Get max pair
+        if not pair_count:
+            break
         max_pair = max(pair_count, key=lambda pair : (pair_count[pair], pair))
         merged_count += 1
         ret_vocab[encoded_special_tokens_id + merged_count] = max_pair[0] + max_pair[1]
         ret_merges.append(max_pair)
 
+        assert(max_pair in pair_to_tokens)
         for tokens in pair_to_tokens[max_pair].copy():
             count = global_word_count[tokens]
             # Decrease pair count
@@ -703,9 +800,70 @@ def run_train_bpe(
             global_word_count[new_tokens] = global_word_count.get(new_tokens, 0) + count
             affected_tokens.add(new_tokens)
 
-        # Clear pair with count == 0
-        # for pair, count in list(pair_count.items()):
-        #     if count == 0:
-        #         pair_count.pop(pair)
+            # Clear pair with count == 0
+            for pair, count in list(pair_count.items()):
+                if count == 0:
+                    pair_count.pop(pair)
+
+    end_time = time.time()
+    print(f'bpe merge {end_time - start_time:.3f}s')
 
     return ret_vocab, ret_merges
+
+
+def train_bpe_tinystories():
+    path = '../data/TinyStoriesV2-GPT4-train.txt'
+    vocab_size = 10000
+    sp_tokens = ["<|endoftext|>"]
+    vocab, merges = run_train_bpe(path, vocab_size, sp_tokens)
+
+    # Pop eof
+    vocab_copy = vocab.copy()
+    vocab_copy.pop(256)
+    longest_token = max(vocab_copy.values(), key=lambda token : len(token))
+    print(f'longest token {longest_token}')
+
+    actual_vocab_size = 256 + len(sp_tokens) + len(merges)
+    print(f'actual vocab size {actual_vocab_size}')
+
+    output_path = '../data/data/tinystories_vocab_merge.pkl'
+    with open(output_path, 'wb') as f:
+        pickle.dump({'vocab': vocab, 'merges': merges}, f)
+
+    with open(output_path, 'rb') as f:
+        saved = pickle.load(f)
+        assert saved['vocab'] == vocab
+        assert saved['merges'] == merges
+
+def train_bpe_owt():
+    path = '../data/owt_train.txt'
+    vocab_size = 32000
+    sp_tokens = ["<|endoftext|>"]
+    vocab, merges = run_train_bpe(path, vocab_size, sp_tokens)
+
+    # Pop eof
+    vocab_copy = vocab.copy()
+    vocab_copy.pop(256)
+    longest_token = max(vocab_copy.values(), key=lambda token : len(token))
+    print(f'longest token {longest_token}')
+
+    actual_vocab_size = 256 + len(sp_tokens) + len(merges)
+    print(f'actual vocab size {actual_vocab_size}')
+
+    output_path = '../data/data/owt_vocab_merge.pkl'
+    with open(output_path, 'wb') as f:
+        pickle.dump({'vocab': vocab, 'merges': merges}, f)
+
+    with open(output_path, 'rb') as f:
+        saved = pickle.load(f)
+        assert saved['vocab'] == vocab
+        assert saved['merges'] == merges
+
+
+if __name__ == '__main__':
+    start_time = time.time()
+    train_bpe_tinystories()
+    train_bpe_owt()
+    end_time = time.time()
+
+    print(f'train {end_time - start_time:.3f}s')
