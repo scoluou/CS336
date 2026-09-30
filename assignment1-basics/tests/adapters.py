@@ -552,15 +552,6 @@ def run_load_checkpoint(
 class BPETokenizer:
     def __init__(self, vocab, merges, sp_tokens=None):
         super().__init__()
-        self.__init_internal(vocab, merges, sp_tokens)
-
-    def from_files(self, file_path, sp_tokens=None):
-        with open(file_path, 'rb') as f:
-            saved = pickle.load(f)
-            self.__init_internal(saved.vocab, saved.merges, sp_tokens)
-
-    def __init_internal(self,
-                        vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], sp_tokens=None):
         self.vocab = vocab
         self.merges = merges
         self.pattern = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
@@ -579,6 +570,12 @@ class BPETokenizer:
             self.sp_token_id: dict[str, int] = {}
             for sp_token in sp_tokens:
                 self.sp_token_id[sp_token] = self.bytes_to_id[sp_token.encode('utf-8')]
+
+    @classmethod
+    def from_files(cls, file_path, sp_tokens=None):
+        with open(file_path, 'rb') as f:
+            saved = pickle.load(f)
+            return BPETokenizer(saved['vocab'], saved['merges'], sp_tokens)
 
     def encode(self, text: str) -> list[int]:
         encoded_ids: list[int] = []
@@ -628,7 +625,8 @@ class BPETokenizer:
         return encoded_ids
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterable[int]:
-        pass
+        for text in iterable:
+            yield from self.encode(text)
 
     def decode(self, ids: list[int]) -> str:
         # Convert to a full bytes and decode once rather than decode each byte
