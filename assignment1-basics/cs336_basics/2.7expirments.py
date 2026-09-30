@@ -1,6 +1,4 @@
-from sympy.codegen.ast import uint16
-
-from adapters import *
+from tests.adapters import *
 import numpy as np
 import pathlib
 
@@ -60,8 +58,10 @@ def encode_tiny_stories():
 
 
 if __name__ == '__main__':
-    # compute_compression_ratio()
+    ...
 
-    # compute_throughput()
+    compute_compression_ratio()
 
-    encode_tiny_stories()
+    compute_throughput()
+
+    # encode_tiny_stories()
