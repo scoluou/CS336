@@ -1,7 +1,12 @@
+from torch.optim.optimizer import ParamsT
+from typing import Callable, Any
+
 import math
 import torch
 import torch.nn as nn
 from einops import einsum, rearrange
+from collections.abc import Iterable, Callable
+from typing import Optional
 
 
 class Linear(nn.Module):
@@ -226,3 +231,129 @@ class Transformer(nn.Module):
             embedded = layer(embedded, token_positions)
 
         return self.lm_head(self.ln_final(embedded))
+
+
+def cross_entropy(inputs: torch.Tensor, targets: torch.Tensor):
+    shifted_logits = inputs - torch.max(inputs, dim=-1, keepdim=True).values
+    shifted_target_logits = shifted_logits.gather(
+        dim=-1,
+        index=targets.long().unsqueeze(-1),
+    ).squeeze(-1)
+
+    log_normalizer = torch.log(torch.exp(shifted_logits).sum(dim=-1))
+    loss = (log_normalizer - shifted_target_logits).mean()
+
+    return loss
+
+
+class SGD(torch.optim.Optimizer):
+    def __init__(self, params: ParamsT , lr: float = 1e-3):
+        if lr < 0:
+            raise ValueError(f'Invalid learning rate {lr}')
+        defaults = {'lr': lr}
+        super().__init__(params, defaults)
+
+    def step(self, closure: Optional[Callable] = None):
+        loss = None if closure is None else closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad.data
+                state = self.state[p]
+                t = state.get('t', 0)
+                p.data -= lr / math.sqrt(t + 1) * grad
+                state['t'] = t + 1
+        return loss
+
+
+class AdamW(torch.optim.Optimizer):
+    def __init__(self, params: ParamsT, lr: float,
+                 betas: tuple[float, float] = (0.9, 0.999),
+                eps: float = 1e-8, weight_decay: float = 1e-2):
+        if lr < 0:
+            raise ValueError(f'Invalid learning rate {lr}')
+        defaults = {
+            'lr': lr,
+            'betas': betas,
+            'eps': eps,
+            'weight_decay': weight_decay
+        }
+        super().__init__(params, defaults)
+
+    def step(self, closure: Optional[Callable] = None):
+        loss = None if closure is None else closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            beta1, beta2 = group['betas']
+            eps = group['eps']
+            weight_decay = group['weight_decay']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad.data
+                state = self.state[p]
+                t = state.get('t', 1)
+                m = state.get('m', 0)
+                v = state.get('v', 0)
+
+                lr_t = lr * math.sqrt(1 - pow(beta2, t)) / (1 - pow(beta1, t))
+                p.data -= lr * weight_decay * p.data
+
+                m = beta1 * m + (1 - beta1) * grad
+                v = beta2 * v + (1 - beta2) * torch.pow(grad, 2)
+                p.data -= lr_t * m / (torch.sqrt(v) + eps)
+
+                state['t'] = t + 1
+                state['m'] = m
+                state['v'] = v
+        return loss
+
+
+class CosineAnnealingScheduling:
+    def __init__(self, max_lr: float, min_lr: float,
+                 warmup_iters: int, cosing_cycle_iters: int):
+        self.max_lr = max_lr
+        self.min_lr = min_lr
+        self.warmup_iters = warmup_iters
+        self.cosine_cycle_iters = cosing_cycle_iters
+
+    def get_current_lr(self, t: int):
+        if t < self.warmup_iters:
+            return t / self.warmup_iters * self.max_lr
+        elif t <= self.cosine_cycle_iters:
+            return (self.min_lr +
+                    0.5 * (1 +
+                           math.cos(math.pi *
+                                    (t - self.warmup_iters) / (self.cosine_cycle_iters - self.warmup_iters)))
+                    * (self.max_lr - self.min_lr))
+        else:
+            return self.min_lr
+
+
+
+def gradient_clipping(parameters: Iterable[nn.Parameter], max_l2_norm: float, eps: float = 1e-6):
+    grads = [p.grad for p in parameters if p.grad is not None]
+    grad_norms = [torch.linalg.vector_norm(g.detach(), ord=2) for g in grads]
+    global_norm = torch.linalg.vector_norm(torch.stack(grad_norms), ord=2)
+
+    if global_norm > max_l2_norm:
+        scale = max_l2_norm / (global_norm + eps)
+        with torch.no_grad():
+            for grad in grads:
+                grad *= scale
+
+
+
+
+
+
+
+
+
+
